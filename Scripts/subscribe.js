@@ -1,6 +1,10 @@
 /**
  * ============================================================
- * 📊 Shadowrocket 机场流量查询 Pro v3.0（诊断版）
+ * 📊 Shadowrocket 机场流量查询 Pro v3.1
+ * ============================================================
+ * 修复：恢复 alpn=h2（解决 CFNetwork 310）
+ *       改进 UA 循环逻辑
+ *       增加 flag 参数备用 URL
  * ============================================================
  */
 
@@ -95,17 +99,13 @@ function tryDecodeBase64(str) {
   return null;
 }
 
-// ---------- 解析 subscription-userinfo（增强） ----------
 function parseUserinfo(header) {
   const r = { upload: null, download: null, total: null, expire: null };
   if (!header) return r;
-  console.log(`[userinfo 原文] ${header}`);
 
   const pick = (key) => {
-    // 带单位
     let m = header.match(new RegExp(key + "\\s*=\\s*([\\d.]+)\\s*(B|KB|MB|GB|TB|PB)", "i"));
     if (m) return parseTraffic(m[1] + m[2]);
-    // 纯数字
     m = header.match(new RegExp(key + "\\s*=\\s*(\\d+)", "i"));
     if (m) return { num: parseInt(m[1]), hasUnit: false };
     return null;
@@ -113,7 +113,6 @@ function parseUserinfo(header) {
 
   let up = pick("upload"), dl = pick("download"), tot = pick("total");
 
-  // 判断是否 GB 单位：total 为小数或小于 10000 视为 GB
   let isGB = false;
   if (tot && typeof tot === "object" && !tot.hasUnit) {
     if (tot.num < 10000 || tot.num % 1 !== 0) isGB = true;
@@ -135,7 +134,6 @@ function parseUserinfo(header) {
   return r;
 }
 
-// ---------- 解析 STATUS= ----------
 function parseStatus(text) {
   const r = { upload: null, download: null, total: null, expire: null };
   if (!text) return r;
@@ -150,9 +148,8 @@ function parseStatus(text) {
   return r;
 }
 
-// ---------- 解析伪节点名（"剩余流量：100GB"） ----------
 function parsePseudo(text) {
-  const r = { upload: null, download: null, total: null, expire: null, remain: null };
+  const r = { upload: null, download: null, total: null, expire: null, remain: null, used: null };
   if (!text) return r;
   let m = text.match(/剩余流量[：:]\s*([\d.]+\s*(?:B|KB|MB|GB|TB|PB))/i);
   if (m) r.remain = parseTraffic(m[1]);
@@ -170,140 +167,149 @@ function getAirportName(url, index) {
   return `机场${index + 1}`;
 }
 
-// ---------- 请求 ----------
-function requestAirport(url, index) {
+// ---------- 一次请求（指定 UA 和 URL） ----------
+function doRequest(name, url, ua) {
   return new Promise(resolve => {
+    const params = {
+      url: url,
+      headers: {
+        "User-Agent": ua,
+        "Accept": "*/*",
+        "Accept-Language": "zh-CN,zh-Hans;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache"
+      },
+      timeout: timeoutSeconds,
+      alpn: "h2"
+    };
+
+    $httpClient.get(params, (error, response, data) => {
+      if (error) { resolve({ error: String(error) }); return; }
+      const status = response && response.status ? response.status : 0;
+      if (status < 200 || status >= 300) { resolve({ error: `HTTP ${status}` }); return; }
+      let body = "";
+      if (typeof data === "string") body = data;
+      else if (data && typeof data.toString === "function") body = data.toString();
+      resolve({ ok: true, headers: response.headers || {}, body });
+    });
+  });
+}
+
+// ---------- 解析一份响应 ----------
+function analyzeResponse(name, headers, body) {
+  const info = { upload: null, download: null, total: null, expire: null, remain: null, used: null };
+
+  // 1. subscription-userinfo
+  let userinfo = null;
+  const headerKeys = [];
+  for (const k in headers) {
+    headerKeys.push(k);
+    if (k.toLowerCase() === "subscription-userinfo") userinfo = headers[k];
+  }
+  console.log(`${name} 响应头 keys：${headerKeys.join(", ") || "(空)"}`);
+
+  if (userinfo) {
+    console.log(`${name} ✅ 发现 userinfo：${userinfo}`);
+    const p = parseUserinfo(userinfo);
+    info.upload = p.upload; info.download = p.download; info.total = p.total; info.expire = p.expire;
+  } else {
+    console.log(`${name} ⚠️ 未找到 subscription-userinfo 头`);
+  }
+
+  // 2. Body / 解码 Body
+  const decoded = tryDecodeBase64(body);
+  const searchText = (body || "") + "\n" + (decoded || "");
+
+  const st = parseStatus(searchText);
+  if (info.upload === null && st.upload !== null) info.upload = st.upload;
+  if (info.download === null && st.download !== null) info.download = st.download;
+  if (info.total === null && st.total !== null) info.total = st.total;
+  if (!info.expire && st.expire) info.expire = st.expire;
+
+  const ps = parsePseudo(searchText);
+  if (info.upload === null && ps.upload !== null) info.upload = ps.upload;
+  if (info.download === null && ps.download !== null) info.download = ps.download;
+  if (info.total === null && ps.total !== null) info.total = ps.total;
+  if (!info.expire && ps.expire) info.expire = ps.expire;
+  if (info.remain === null && ps.remain !== null) info.remain = ps.remain;
+  if (info.used === null && ps.used !== null) info.used = ps.used;
+
+  // 计算
+  let used = info.used;
+  if (used === null && info.upload !== null && info.download !== null) used = info.upload + info.download;
+  if (used === null && info.total !== null && info.remain !== null) used = info.total - info.remain;
+  let remain = info.remain;
+  if (remain === null && info.total !== null && used !== null) remain = Math.max(0, info.total - used);
+  let percent = null;
+  if (used !== null && info.total !== null && info.total > 0) percent = (used / info.total) * 100;
+
+  return { info, used, remain, percent, userinfo, hasUserinfo: !!userinfo, headerKeys };
+}
+
+// ---------- 单机场：多 UA + 多 URL ----------
+function requestAirport(url, index) {
+  return new Promise(async resolve => {
     const name = getAirportName(url, index);
     console.log(`\n========== ${name} ==========`);
 
-    const UAS = ["ClashforWindows/0.20.39", "Shadowrocket/1.0", "Surge/5.0"];
-    let uaIdx = 0;
+    // 备用 URL：原 URL 加 flag 参数
+    const urls = [url];
+    const flag = url.includes("?") ? "&flag=clash" : "?flag=clash";
+    urls.push(url + flag);
+    const flag2 = url.includes("?") ? "&flag=shadowrocket" : "?flag=shadowrocket";
+    urls.push(url + flag2);
 
-    function attempt() {
-      if (uaIdx >= UAS.length) {
-        resolve({ success: false, name, error: "所有 UA 均无流量信息", diagnostic: "no-data" });
-        return;
+    const UAS = ["Shadowrocket/2.2.0", "ClashforWindows/0.20.39", "Surge/5.8.0"];
+
+    let lastDiag = { headerKeys: [], bodySnippet: "", userinfo: "" };
+
+    for (let ui = 0; ui < urls.length; ui++) {
+      for (let ai = 0; ai < UAS.length; ai++) {
+        const tryUrl = urls[ui];
+        const ua = UAS[ai];
+        console.log(`${name} [${ui+1}/${urls.length}] UA=${ua}`);
+
+        const res = await doRequest(name, tryUrl, ua);
+        if (res.error) {
+          console.log(`${name} 请求失败：${res.error}`);
+          lastDiag.error = res.error;
+          continue;
+        }
+
+        const analysis = analyzeResponse(name, res.headers, res.body);
+
+        // 记录诊断信息
+        lastDiag.headerKeys = analysis.headerKeys;
+        lastDiag.bodySnippet = (res.body || "").substring(0, 300);
+        lastDiag.userinfo = analysis.userinfo || "";
+
+        // 判定成功：拿到 userinfo 头，或拿到至少一个流量字段
+        if (analysis.hasUserinfo || analysis.info.total !== null || analysis.info.upload !== null || analysis.info.download !== null) {
+          console.log(`${name} ✅ 拿到数据：UA=${ua} URL变体=${ui+1}`);
+          resolve({
+            success: true, name,
+            upload: analysis.info.upload,
+            download: analysis.info.download,
+            total: analysis.info.total,
+            used: analysis.used,
+            remain: analysis.remain,
+            percent: analysis.percent,
+            expire: analysis.info.expire,
+            uaUsed: ua
+          });
+          return;
+        }
       }
-      const ua = UAS[uaIdx];
-      console.log(`${name} 尝试 UA：${ua}`);
-
-      const params = {
-        url: url,
-        headers: {
-          "User-Agent": ua,
-          "Accept": "*/*",
-          "Accept-Language": "zh-CN,zh-Hans;q=0.9",
-          "Cache-Control": "no-cache",
-          "Pragma": "no-cache"
-        },
-        timeout: timeoutSeconds
-      };
-
-      $httpClient.get(params, (error, response, data) => {
-        if (error) {
-          console.log(`${name} 错误：${error}`);
-          resolve({ success: false, name, error: String(error) });
-          return;
-        }
-
-        const status = response && response.status ? response.status : 0;
-        console.log(`${name} HTTP：${status}`);
-        console.log(`${name} 响应头：${response && response.headers ? JSON.stringify(response.headers) : "(无 headers)"}`);
-
-        if (status < 200 || status >= 300) {
-          resolve({ success: false, name, error: `HTTP ${status}` });
-          return;
-        }
-
-        // 处理 data：转字符串
-        let body = "";
-        if (typeof data === "string") body = data;
-        else if (data && typeof data.toString === "function") body = data.toString();
-
-        console.log(`${name} Body 前200：${body.substring(0, 200)}`);
-
-        const decoded = tryDecodeBase64(body);
-        if (decoded) console.log(`${name} Base64解码前200：${decoded.substring(0, 200)}`);
-        else console.log(`${name} 非 Base64`);
-
-        const searchText = (body || "") + "\n" + (decoded || "");
-
-        const info = { upload: null, download: null, total: null, expire: null, remain: null, used: null };
-
-        // 1. subscription-userinfo 头
-        let userinfo = null;
-        if (response && response.headers) {
-          for (const k in response.headers) {
-            if (k.toLowerCase() === "subscription-userinfo") { userinfo = response.headers[k]; break; }
-          }
-        }
-        if (userinfo) {
-          const p = parseUserinfo(userinfo);
-          info.upload = p.upload; info.download = p.download; info.total = p.total; info.expire = p.expire;
-        }
-
-        // 2. STATUS 行
-        const st = parseStatus(searchText);
-        if (info.upload === null && st.upload !== null) info.upload = st.upload;
-        if (info.download === null && st.download !== null) info.download = st.download;
-        if (info.total === null && st.total !== null) info.total = st.total;
-        if (!info.expire && st.expire) info.expire = st.expire;
-
-        // 3. 伪节点
-        const ps = parsePseudo(searchText);
-        if (info.upload === null && ps.upload !== null) info.upload = ps.upload;
-        if (info.download === null && ps.download !== null) info.download = ps.download;
-        if (info.total === null && ps.total !== null) info.total = ps.total;
-        if (!info.expire && ps.expire) info.expire = ps.expire;
-        if (info.remain === null && ps.remain !== null) info.remain = ps.remain;
-        if (info.used === null && ps.used !== null) info.used = ps.used;
-
-        // 4. JSON 兜底
-        try {
-          const m = searchText.match(/\{[^{}]*"(upload|download|total|expire)"[^{}]*\}/);
-          if (m) {
-            const obj = JSON.parse(m[0]);
-            if (info.upload === null && obj.upload != null) info.upload = parseFloat(obj.upload);
-            if (info.download === null && obj.download != null) info.download = parseFloat(obj.download);
-            if (info.total === null && obj.total != null) info.total = parseFloat(obj.total);
-            if (!info.expire && obj.expire != null) info.expire = formatTimestamp(parseInt(obj.expire));
-          }
-        } catch (e) {}
-
-        // 计算
-        let used = info.used;
-        if (used === null && info.upload !== null && info.download !== null) used = info.upload + info.download;
-        if (used === null && info.total !== null && info.remain !== null) used = info.total - info.remain;
-
-        let remain = info.remain;
-        if (remain === null && info.total !== null && used !== null) remain = Math.max(0, info.total - used);
-
-        let percent = null;
-        if (used !== null && info.total !== null && info.total > 0) percent = (used / info.total) * 100;
-
-        // 全都为空：换 UA 再试
-        if (info.total === null && info.upload === null && info.download === null && !info.expire) {
-          console.log(`${name} 该 UA 未获取到数据，换 UA 重试`);
-          uaIdx++;
-          setTimeout(attempt, 200);
-          return;
-        }
-
-        console.log(`${name} ✅ 上传=${info.upload} 下载=${info.download} 总量=${info.total} 到期=${info.expire}`);
-
-        resolve({
-          success: true, name,
-          upload: info.upload, download: info.download, total: info.total,
-          used, remain, percent, expire: info.expire,
-          uaUsed: ua,
-          bodySnippet: body.substring(0, 300),
-          decodedSnippet: decoded ? decoded.substring(0, 300) : "",
-          userinfoRaw: userinfo || ""
-        });
-      });
     }
 
-    attempt();
+    // 所有组合都没拿到：返回诊断
+    console.log(`${name} ❌ 所有组合均未获取到流量信息`);
+    resolve({
+      success: false,
+      name,
+      error: "订阅未返回流量信息",
+      diagnostic: lastDiag
+    });
   });
 }
 
@@ -321,7 +327,17 @@ function getExpireText(expire) {
 
 function formatResult(item) {
   if (!item.success) {
-    return `❌ ${item.name}\n   失败：${item.error}`;
+    let s = `❌ ${item.name}\n   失败：${item.error}`;
+    if (item.diagnostic) {
+      const d = item.diagnostic;
+      if (d.headerKeys && d.headerKeys.length) {
+        s += `\n   响应头：${d.headerKeys.slice(0, 6).join(", ")}`;
+      }
+      if (d.bodySnippet) {
+        s += `\n   Body片段：${d.bodySnippet.substring(0, 100).replace(/\n/g, " ")}`;
+      }
+    }
+    return s;
   }
   const f = (v) => v !== null && v !== undefined ? formatBytes(v) : "未获取";
   return (
@@ -339,7 +355,7 @@ function formatResult(item) {
 
 (async () => {
   console.log("================================");
-  console.log("📊 机场流量查询 Pro v3.0 诊断版");
+  console.log("📊 机场流量查询 Pro v3.1");
   console.log(`机场数量：${subList.length}`);
   console.log("================================");
 
@@ -355,16 +371,6 @@ function formatResult(item) {
   for (const r of results) { output.push(formatResult(r)); output.push("━━━━━━━━━━━━━━━━"); }
   output.push(`🕐 查询时间：${new Date().toLocaleString("zh-CN",{hour12:false})}`);
   output.push(`✅ 成功：${success}  ❌ 失败：${failed}`);
-
-  // 如果全部失败，把诊断片段塞进通知
-  if (success === 0) {
-    output.push("━━━━━━━━━━━━━━━━");
-    output.push("🔍 诊断片段：");
-    const diag = results[0];
-    if (diag.bodySnippet) output.push(`Body: ${diag.bodySnippet.substring(0, 120)}`);
-    if (diag.decodedSnippet) output.push(`解码: ${diag.decodedSnippet.substring(0, 120)}`);
-    if (diag.userinfoRaw) output.push(`Userinfo: ${diag.userinfoRaw.substring(0, 120)}`);
-  }
 
   const message = output.join("\n");
   console.log("\n" + message);
