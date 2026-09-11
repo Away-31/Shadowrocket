@@ -1,0 +1,53 @@
+#!name=机场流量查询
+#!desc=每小时查询机场订阅流量与到期时间，汇总成一条通知。兼容 subscription-userinfo 响应头与 base64 body STATUS 行两种格式。
+#!author=Hermes
+#!system=ios
+#!arguments=机场订阅链接:https%3A%2F%2Fnowjump.tiaotiao.org%2Fhttps%3A%2F%2Fhi.nowjiasu.com%2Fnow%2Fc89d94262b2253531ff5f7b230a6bb41
+#!arguments-desc=机场订阅链接：多个机场用英文逗号分隔；链接需 URL 编码（用在线 URL 编码工具或直接粘贴，Shadowrocket 会自动识别）。\n\n留空则使用模块内置的默认链接。
+#!homepage=
+
+[Script]
+机场流量查询 = type=cron,cronexp=0 * * * *,wake-system=1,timeout=120,engine=auto,script-path=airport_traffic.js,argument=机场订阅链接={{{机场订阅链接}}}
+
+# ============================================================================
+# 使用说明（本段为注释，不影响功能）
+# ============================================================================
+#
+# 【安装步骤】
+#   1. 把 airport_traffic.js 和本 .module 文件放到同一目录。
+#      推荐位置： 文件 App > iCloud云盘 > Shadowrocket > Script
+#      （Shadowrocket 的 script-path 相对路径基准目录就是这里）
+#   2. 打开 Shadowrocket > 配置 > 模块 > 右上角 ➕ > 填写模块路径或导入
+#      · 若已同步到 iCloud：模块会出现在模块列表，直接启用
+#      · 若从文件导入：右上角 ➕ > 选择本 .module 文件
+#   3. 点击模块 > 编辑参数 > 填写「机场订阅链接」（可留空用默认）
+#   4. 确保模块处于启用状态
+#
+# 【验证是否生效】
+#   · 模块启用后，Shadowrocket > 数据 > 脚本日志 可看到运行记录
+#   · 首次可手动触发：把 cronexp 临时改成下一分钟，等待通知
+#
+# 【改成远程脚本（可选，便于多设备同步）】
+#   把 airport_traffic.js 上传到你的 GitHub 仓库后，
+#   把上面 script-path 改成 raw 链接，例如：
+#   script-path=https://raw.githubusercontent.com/用户名/仓库/main/airport_traffic.js
+#
+# 【多机场】
+#   在「编辑参数」里填多个链接，用英文逗号分隔（每个链接都需 URL 编码）。
+#   脚本已内置 1.5 秒间隔 + 串行请求，不会被机场判定为频繁访问。
+#
+# 【为什么原脚本拿不到数据】
+#   nowjiasu(hi.nowjiasu.com) 的订阅响应【不含】subscription-userinfo 头，
+#   流量数据在 base64 body 的第一行：
+#     STATUS=🚀↑:8.55GB,↓:48.56GB,TOT:100GB💡Expires:2026-09-28
+#   本脚本按 响应头 -> body明文 -> body base64 -> 节点备注 四层依次解析。
+#
+# ============================================================================
+# 【分流要求】
+#   hi.nowjiasu.com 解析到 8.7.198.46（非 Cloudflare），实测直连 443
+#   会被重置，必须走代理。请确认该域名分流规则指向 PROXY。
+#
+# ============================================================================
+# 本模块不覆盖任何全局设置，仅注册一个 cron 定时脚本。
+# 不包含 [MITM] 段，因此无需 HTTPS 解密、不影响证书配置。
+# ============================================================================
