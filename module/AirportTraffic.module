@@ -1,0 +1,11 @@
+#!name=📊 机场流量查询 Pro
+#!desc=定时查询多个机场订阅的上传、下载、总量、已用、剩余、使用率和到期时间
+#!category=工具
+#!arguments=启用定时任务脚本:true,流量定时查询时间:*/10 * * * *,机场订阅链接地址:https://example.com/link1|https://example.com/link2,请求超时时间:10
+#!arguments-desc=启用定时任务脚本：是否启用Cron；流量定时查询时间：Cron表达式，例如*/10 * * * *；机场订阅链接地址：多个订阅使用|分隔；请求超时时间：单位秒
+
+[Script]
+📊机场流量查询 = type=cron, script-path=https://raw.githubusercontent.com/Away-31/Shadowrocket/main/Scripts/subscribe.js, cronexpr={{{流量定时查询时间}}}, timeout=60, script-update-interval=0, argument="机场订阅链接={{{机场订阅链接地址}}}&请求超时时间={{{请求超时时间}}}"
+
+[MITM]
+hostname = %APPEND% example.com
